@@ -1,20 +1,17 @@
 {
-  "name": "node-ws",
+  "name": "site",
   "version": "1.0.0",
-  "description": "Node.js Server",
+  "description": "Lightweight site service with a live feed channel",
   "main": "app.js",
-  "author": "",
-  "repository": "",
-  "license": "MIT",
-  "private": false,
+  "license": "GPL-3.0",
+  "private": true,
   "scripts": {
     "start": "node app.js"
   },
   "dependencies": {
-    "ws": "^8.14.2",
-    "axios": "^1.6.2"
+    "ws": "^8.14.2"
   },
   "engines": {
-    "node": ">=14"
+    "node": ">=14.17"
   }
 }
