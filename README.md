@@ -23,14 +23,17 @@ stuck, that section's numbered step is where to look.
 
 ## What you need before you start
 
-1. **A free web host.** This guide covers two flavors:
+1. **A free web host.** This guide covers three flavors:
    - the panel has a **Node.js application manager** (example: Webhostmost)
      → follow **[Path A](#path-a--panel-with-a-nodejs-application-manager-example-webhostmost)**
    - the panel has **no Node.js manager and no terminal**, but it has
      **cron jobs + `.htaccess`** (example: DataOnline free hosting,
      DirectAdmin panel) → follow **[Path B](#path-b--panel-without-a-nodejs-manager-example-dataonline)**
-   Both flavors must also give you: a file manager, an SSL certificate
-   section, and (Path B) a cron job section.
+   - the panel is a **Pterodactyl game panel** with a Node.js egg
+     (example: Nodaroo free) → follow **[Path C](#path-c--pterodactyl-game-panel-with-a-nodejs-egg-example-nodaroo-free)**
+   Paths A and B must also give you: a file manager, an SSL certificate
+   section, and (Path B) a cron job section. Path C needs no domain of
+   your own — the panel gives you one hostname and port.
 2. **A domain or subdomain of your own** — you must be able to add an
    **A record** to its DNS (Cloudflare, your registrar, ...). A subdomain
    like `vn.yourdomain.com` is all that's needed.
@@ -314,6 +317,92 @@ jobs *can* execute it. So this path uses three tricks:
 
 ---
 
+## Path C — Pterodactyl game panel with a Node.js egg (example: Nodaroo free)
+
+The panel runs game servers in Docker containers, but its "node.js
+generic" egg is just a Node.js runtime — the program runs on it
+unchanged apart from three small differences (all in
+`app-pterodactyl.js`, a separate file so `app.js` stays untouched):
+
+1. **Port:** Pterodactyl gives each server one allocation (one
+   hostname + port, e.g. `au2.example.fun:25858`) and injects it as
+   the `SERVER_PORT` environment variable. The Path C file listens
+   on `SERVER_PORT` instead of the `PORT` in `app.js`.
+2. **No TLS:** a Pterodactyl host offers no port 443, no TLS
+   certificate and no custom domain. The feed link is therefore
+   plain WebSocket by default: `security=none`, port = the listen
+   port. Traffic is unencrypted — anyone on the path can read it.
+   (If you later put a TLS tunnel in front of the server, edit the
+   `LINK_SECURITY` / `LINK_PORT` defaults in the file to `tls` /
+   `443` and the link goes back to the TLS form.)
+3. **Domain:** there is no panel variable for it. Edit the `DOMAIN`
+   line in `app-pterodactyl.js` to your allocation hostname
+   (e.g. `au2.example.fun`) before uploading.
+
+`package.json` is the same file as Paths A/B (one dependency: `ws`).
+No `.htaccess`, no `health.sh`, no `setup.sh` — the panel is the app
+manager here, and it restarts the server from its own console.
+
+### Steps
+
+1. **Create the server.** In the panel, create a server with the
+   **"node.js generic"** egg (described as a Node.js runtime for
+   JavaScript apps). Note the allocation it gives you: a hostname
+   and one port (e.g. `au2.example.fun:25858`). That port is the
+   only public port your node will have — there is no way to add a
+   443 allocation or a custom domain.
+2. **Edit the domain.** Open `app-pterodactyl.js` in a text editor
+   and set `DOMAIN` to your allocation hostname (no `https://`,
+   no port). Save it.
+3. **Upload the files.** Panel → your server → **Files** → upload
+   **`app-pterodactyl.js`** (rename it to **`app.js`** on upload,
+   or keep the name and set `MAIN_FILE` to match) and
+   **`package.json`** into `/home/container/` — and only those two.
+4. **Set the startup file.** Server → **Startup** (or Variables):
+   set `MAIN_FILE` to `app.js` (it defaults to `index.js`).
+   Change nothing else.
+5. **Start it.** Server → **Console** → **Start**. The startup
+   command auto-runs `npm install` from `package.json`, then runs
+   the program. Wait for `HTTP server is running on port <your
+   allocation port>` in the console.
+6. **Check it works:** open `http://<hostname>:<port>/` in a
+   browser — it should show `Hello, World` (note: plain `http`,
+   not `https`). Then open `http://<hostname>:<port>/feed` — one
+   line of base64 text. Then do the [verification
+   checklist](#verification-checklist) and [use the
+   node](#using-the-node), with the differences below.
+
+### Using the node on Path C
+
+- **Subscription URL is plain HTTP:** `http://<hostname>:<port>/feed`
+  (not `https://`). Paste that into your client as a subscription.
+- **Manual entry:** address = allocation hostname, port = allocation
+  port, TLS off / security `none`, transport `ws`, path `/`,
+  host = allocation hostname.
+- **UDP: on** — the relay works the same as on Paths A/B; leave UDP
+  on in your client. Mux: off (not served).
+
+### Keeping a Path C node alive
+
+The panel is the supervisor: use its **Restart** button after code
+changes, and its console to see crashes. There is no cron-based
+reviver to add here — the process is managed by the panel, and a
+`nohup` revive from inside the container would fight it. If the
+server goes offline, restart it in the panel; if it keeps crashing,
+read the console log (usually a startup error, e.g. a missing
+dependency — the startup command already runs `npm install`, so
+check the log for its output first).
+
+### Troubleshooting (Path C)
+
+| Symptom | Check |
+|---|---|
+| `http://<hostname>:<port>/` doesn't load | Is the server actually running in the console (not Offline / Installing)? Does the console show `HTTP server is running on port <allocation port>`? If it shows another port, `SERVER_PORT` was not injected — check the server's Network tab for the allocation and restart the server. |
+| Feed opens, client can't connect | Did you edit `DOMAIN` in the file to the allocation hostname? Is the client's port the allocation port (not 443)? Is TLS off in the client (security `none`)? |
+| Client works, then stops | The panel may have stopped the server (idle / resource limits on free plans). Restart it in the panel. Free plans usually give exactly one server slot — a second server cannot be created without buying a slot. |
+
+---
+
 ## Verification checklist
 
 Work through all five — if one fails, jump to
@@ -419,6 +508,7 @@ files.
 | File | Purpose |
 |---|---|
 | `app.js` | the whole node — single file |
+| `app-pterodactyl.js` | Path C: same program, plain link, listens on the panel's allocated port |
 | `package.json` | one dependency: `ws` |
 | `.htaccess` | Path B: web-server rules (routing + file hiding) |
 | `health.sh` | Path B: per-minute liveness cron |
