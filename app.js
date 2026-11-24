@@ -19,6 +19,7 @@
 
 const http = require('http');
 const net = require('net');
+const dgram = require('dgram');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -112,14 +113,79 @@ if (!DOMAIN) {
 //   [1..16]       client ID (16 raw bytes)
 //   [17]          options length (0 in plain mode; >0 for encrypted flows,
 //                 which this service does not decrypt)
-//   [18+options]  mode (0 = stream, 1 = datagrams; only streams are served)
+//   [18+options]  command (1 = TCP stream, 2 = UDP, 3 = Mux, 4 = reverse;
+//                   0 is also accepted as TCP for the old dialect)
 //   [19+options]  target port (2 bytes, big endian)
 //   [21+options]  address type (1 = IPv4, 2 = name, 3 = IPv6)
 //   [22+options]  address, then the first payload bytes
-// On success we answer [0, 0] (revision + options length) and pipe the
-// channel to the TCP connection. On failure the reference implementation
-// closes without a response header, so we do the same. All later frames flow
-// through the pipe and must not be re-parsed here.
+// On success we answer [0, 0] (revision + options length). For TCP the
+// channel is then piped to the TCP connection. For UDP, later frames are
+// length-prefixed UDP packets ([2B length][payload]) and answers come back
+// the same way. On failure the reference implementation closes without a
+// response header, so we do the same.
+
+
+// --- UDP relay (standard VLESS command 2) ------------------------------------
+// One WebSocket connection carries one UDP destination (host:port from the
+// header). Each UDP packet in the stream is [2B length BE][payload]; the
+// first payload may also arrive as a bare packet, which we accept as well.
+// Answers go back as [version, 0] (first answer only) + [2B length][payload].
+function createUdpRelay(ws, version, host, targetPort) {
+  const udp = dgram.createSocket(host.includes(':') ? 'udp6' : 'udp4');
+  let headerSent = false;
+  let closed = false;
+  let buf = Buffer.alloc(0);
+  let idle = setTimeout(close, 30000);
+  function refresh() { clearTimeout(idle); idle = setTimeout(close, 30000); }
+  function close() {
+    if (closed) return;
+    closed = true;
+    clearTimeout(idle);
+    try { udp.close(); } catch (e) { /* already closed */ }
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      try { ws.close(); } catch (e) { /* gone */ }
+    }
+  }
+  function sendPacket(packet) {
+    if (closed || packet.length === 0) return;
+    refresh();
+    udp.send(packet, targetPort, host, err => {
+      if (err) console.error('udp send error: ' + err.message);
+    });
+  }
+  function feed(chunk, isFirst) {
+    if (closed || !Buffer.isBuffer(chunk) || chunk.length === 0) return;
+    refresh();
+    if (isFirst && chunk.length >= 2) {
+      const len = chunk.readUInt16BE(0);
+      if (2 + len > chunk.length) { sendPacket(chunk); return; } // bare packet
+    }
+    buf = Buffer.concat([buf, chunk]);
+    while (buf.length >= 2) {
+      const len = buf.readUInt16BE(0);
+      if (len === 0) { buf = buf.slice(2); continue; }
+      if (buf.length < 2 + len) break; // wait for the rest of this packet
+      sendPacket(buf.slice(2, 2 + len));
+      buf = buf.slice(2 + len);
+    }
+  }
+  udp.on('message', data => {
+    if (closed) return;
+    refresh();
+    const lenBuf = Buffer.alloc(2);
+    lenBuf.writeUInt16BE(data.length, 0);
+    const prefix = headerSent ? Buffer.alloc(0) : Buffer.from([version, 0]);
+    headerSent = true;
+    try { ws.send(Buffer.concat([prefix, lenBuf, data])); } catch (e) { close(); }
+  });
+  udp.on('error', err => {
+    console.error('udp error: ' + err.message);
+    close();
+  });
+  ws.on('close', close);
+  ws.on('error', close);
+  return { feed, close };
+}
 
 // Cap each message at 1 MiB (the 100 MiB default is far more than a channel
 // frame ever needs; a few of them would exhaust a small host's memory).
@@ -135,6 +201,7 @@ function reject(ws) {
 wss.on('connection', ws => {
   let socket = null;
   let opened = false;
+  let udpRelay = null;
 
   // A connection that never sends its first frame carries no data — release
   // it so a public port cannot fill up with idle sockets.
@@ -143,7 +210,10 @@ wss.on('connection', ws => {
   }, 10000);
 
   ws.on('message', msg => {
-    if (opened) return; // first frame handled; later frames go via the pipe
+    if (opened) { // TCP: later frames go via the pipe; UDP: length-prefixed packets
+      if (udpRelay) udpRelay.feed(msg, false);
+      return;
+    }
     clearTimeout(firstFrameTimer);
 
     if (!Buffer.isBuffer(msg) || msg.length < 19) {
@@ -162,18 +232,22 @@ wss.on('connection', ws => {
       return;
     }
 
-    // Parse the destination (fixed order: mode, port, address type, address).
+    // Parse the destination (fixed order: command, port, address type, address).
     // Everything is read inside a guard: malformed frames must close the
     // channel, never crash the service.
     let host;
     let targetPort;
     let payload;
+    let command;
     try {
       let i = 18 + optionsLen;
-      const mode = msg.readUInt8(i);
+      command = msg.readUInt8(i);
       i += 1;
-      if (mode !== 0) { // 0 = stream, 1 = datagrams (not served by this site)
-        throw new Error('unsupported mode ' + mode);
+      // Standard VLESS: 1 = TCP, 2 = UDP. 0 is the old dialect's TCP.
+      // 3 = Mux and 4 = reverse are not served; a client using Mux must
+      // turn it off. Anything else is a malformed frame.
+      if (command !== 0 && command !== 1 && command !== 2) {
+        throw new Error('unsupported command ' + command);
       }
       targetPort = msg.readUInt16BE(i);
       i += 2;
@@ -209,7 +283,13 @@ wss.on('connection', ws => {
       return;
     }
 
-    console.log('route to ' + host + ':' + targetPort);
+    console.log('route to ' + host + ':' + targetPort + (command === 2 ? ' (udp)' : ''));
+    if (command === 2) {
+      opened = true;
+      udpRelay = createUdpRelay(ws, version, host, targetPort);
+      udpRelay.feed(payload, true);
+      return;
+    }
     try {
       ws.send(new Uint8Array([version, 0])); // success ack
     } catch (e) {
