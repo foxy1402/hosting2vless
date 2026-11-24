@@ -127,6 +127,53 @@ The panel runs the program for you; you only upload two files.
    [verification checklist](#verification-checklist) and
    [use the node](#using-the-node).
 
+### Keeping a Path A node alive
+
+Path B has `health.sh` because cron *is* the app manager there. Path A
+is different: the panel runs the program for you, and there is **no
+universal way to restart a panel-managed app** — every panel restarts it
+differently (a button, an API call, an SSH command, or a built-in
+"restart on crash" toggle).
+
+**If the panel offers cron, you can revive the process the same way
+Path B does — but only if three things are true:**
+
+1. Cron runs on the **same server** as the app, with the same
+   filesystem, so it can see the app's port and start `node app.js`
+   in the same folder.
+2. The host **allows** background processes started from cron.
+3. Nothing else is also managing that process (otherwise two starters
+   fight over one port and you get `EADDRINUSE`).
+
+If all three hold, adapt `health.sh` to Path A values — the panel's
+Node path, the app folder, and the panel's port (not the default
+`28741` if the panel assigned a different one) — and schedule it
+every minute. It revives the process within a minute, exactly like
+Path B. Test it the same way: stop the app in the panel, wait a
+minute, and check the log for a new `service starting` line with no
+duplicate process.
+
+If any of the three is false, that revive cannot work there. The
+counterexample is Alwaysdata: it has scheduled tasks in the panel,
+but they run on the SSH host while the site runs on a separate site
+host, so a port check always fails and a `nohup node app.js` would
+start a second, unreachable copy. For those hosts, use
+`health-pathA.sh` instead: it probes the public URL every 5 minutes
+(a request also *wakes* an app the host stopped after 15–30 minutes
+idle, and probing keeps it warm so it never goes idle), and if the
+site still does not answer after 3 probes it runs a restart hook you
+fill in for your host (`RESTART_CMD` / `RESTART_URL` — e.g. the
+Alwaysdata API site-restart call, or an SSH restart command), at most
+once per 5 minutes, then probes again and logs the outcome. Leave the
+hook empty and the script is probe-only. Schedule it with the panel's
+cron / scheduled tasks, or from anywhere that can reach the public
+URL (a free external cron hitting `https://your-domain/` every 5
+minutes does the wake / keep-warm part by itself).
+
+Do not copy Path B's `health.sh` to a Path A host blindly: it checks a
+local port and starts the app with `nohup node app.js &`, which only
+works when cron and the app share a host.
+
 *Optional — hide the node behind a Cloudflare Worker reverse proxy:*
 deploy a Worker on Cloudflare pointed at a domain you control, with this
 code (replace the list with your node domain):
@@ -308,7 +355,9 @@ vless://<uuid>@your-domain:443?encryption=none&security=tls&sni=your-domain&type
 
 Notes for manual configuration:
 
-- **UDP: off** (or "fake UDP") — this node carries TCP only.
+- **UDP: on** — this node relays UDP too (standard command 2,
+  length-prefixed packets; a bare first packet is also accepted).
+  Leave UDP on in your client; DNS over the tunnel needs it.
 - TLS: on; server name (SNI) = your domain; WS path = `/`.
 
 ---
@@ -320,7 +369,7 @@ Notes for manual configuration:
 | `https://your-domain/feed` → connection error (Path B) | Is the `health.sh` cron still there? Does `public_html/site.log` show a startup line in the last minute? Open `site.log` in the file manager — the last lines say what's wrong (e.g. a port conflict). |
 | `https://your-domain/feed` → 503 (Path B) | The web server can't reach the internal port: the program is down (see above) **or** `PORT` in `app.js` no longer matches the port in `.htaccess` / `health.sh`. (An empty `DOMAIN` in `app.js` also makes the feed answer 503 on purpose.) |
 | `https://your-domain/feed` → 404 | You're hitting the wrong path (the feed is at `/feed`, not `/sub`). Or `DOMAIN` was typed with a typo — the endpoint itself is fine, but double-check the URL you opened. |
-| Feed opens, client can't connect | Certificate not issued yet (gray-cloud DNS + Let's Encrypt done?), `DOMAIN` in `app.js` doesn't exactly match the URL you're using, or your client has UDP on. |
+| Feed opens, client can't connect | Certificate not issued yet (gray-cloud DNS + Let's Encrypt done?), `DOMAIN` in `app.js` doesn't exactly match the URL you're using, or Mux is on in your client (this node does not serve Mux). |
 | Client works, then stops after a host reboot (Path B) | Normal — the `health.sh` cron brings it back within a minute. Check `site.log` for the new `service starting` line. |
 | I edited `app.js` but nothing changed | The running program still has the old code. Path A: use the panel's stop/start buttons. Path B: run the self-heal `kill` step once — it restarts within a minute with the new code. |
 
@@ -373,6 +422,7 @@ files.
 | `package.json` | one dependency: `ws` |
 | `.htaccess` | Path B: web-server rules (routing + file hiding) |
 | `health.sh` | Path B: per-minute liveness cron |
+| `health-pathA.sh` | Path A: probe / keep-alive every 5 minutes, optional restart hook (see "Keeping a Path A node alive") |
 | `setup.sh` | Path B: one-time dependency install |
 | `LICENSE` | GPL-3.0 |
 

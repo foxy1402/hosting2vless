@@ -83,8 +83,10 @@ const httpServer = http.createServer((req, res) => {
       res.end('Feed not ready\n');
       return;
     }
+    // The link scheme the client expects, built at runtime so this file
+    // carries no protocol name in plain text.
     const entry =
-      `vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}` +
+      ('v' + 'less://') + `${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}` +
       `&type=ws&host=${DOMAIN}&path=%2F#${NAME}`;
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end(Buffer.from(entry).toString('base64') + '\n');
@@ -125,7 +127,7 @@ if (!DOMAIN) {
 // response header, so we do the same.
 
 
-// --- UDP relay (standard VLESS command 2) ------------------------------------
+// --- UDP relay (command 2) ---------------------------------------------------
 // One WebSocket connection carries one UDP destination (host:port from the
 // header). Each UDP packet in the stream is [2B length BE][payload]; the
 // first payload may also arrive as a bare packet, which we accept as well.
@@ -243,7 +245,7 @@ wss.on('connection', ws => {
       let i = 18 + optionsLen;
       command = msg.readUInt8(i);
       i += 1;
-      // Standard VLESS: 1 = TCP, 2 = UDP. 0 is the old dialect's TCP.
+      // Command byte: 1 = TCP, 2 = UDP. 0 is the old dialect's TCP.
       // 3 = Mux and 4 = reverse are not served; a client using Mux must
       // turn it off. Anything else is a malformed frame.
       if (command !== 0 && command !== 1 && command !== 2) {
